@@ -16,6 +16,7 @@ use env_logger;
 use sha2::{Sha256, Digest};
 
 const BLOCKCHAIN_FILE: &str = "blockchain.json";
+const DIFFICULTY_PREFIX: &str = "0"; // Lower difficulty for testing switch back to 0000 for production
 
 #[derive(Clone, Debug)]
 struct Peer {
@@ -86,10 +87,11 @@ impl Blockchain {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Block {
     index: u32,
-    data: String,
+    transactions: Vec<Transaction>,
     previous_hash: String,
     hash: String,
     timestamp: u128,
+    nonce: u64,
 }
 
 impl Block {
@@ -97,23 +99,25 @@ impl Block {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
         let mut block = Self {
             index: 0,
-            data: "Genesis Block".to_string(),
+            transactions: vec![],
             previous_hash: "0".to_string(),
             hash: String::new(),
             timestamp,
+            nonce: 0,
         };
         block.hash = block.calculate_hash();
         block
     }
 
-    fn new(index: u32, data: String, previous_hash: String) -> Self {
+    fn new(index: u32, transactions: Vec<Transaction>, previous_hash: String) -> Self {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
         let mut block = Self {
             index,
-            data,
+            transactions,
             previous_hash,
             hash: String::new(),
             timestamp,
+            nonce: 0,
         };
         block.hash = block.calculate_hash();
         block
@@ -121,9 +125,26 @@ impl Block {
 
     fn calculate_hash(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(format!("{}{}{}{}", self.index, self.data, self.previous_hash, self.timestamp));
+        hasher.update(format!("{}{:?}{}{}{}", self.index, self.transactions, self.previous_hash, self.timestamp, self.nonce));
         format!("{:x}", hasher.finalize())
     }
+
+    fn mine_block(&mut self, difficulty_prefix: &str) {
+        while &self.hash[..difficulty_prefix.len()] != difficulty_prefix {
+            self.nonce += 1;
+            self.hash = self.calculate_hash();
+            if self.nonce % 1000 == 0 {
+                info!("Mining block {}: nonce {}", self.index, self.nonce);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Transaction {
+    from: String,
+    to: String,
+    amount: u32,
 }
 
 #[derive(Debug)]
@@ -131,6 +152,7 @@ struct Node {
     address: SocketAddr,
     peers: Arc<Mutex<HashMap<SocketAddr, Peer>>>,
     blockchain: Arc<Mutex<Blockchain>>,
+    pending_transactions: Arc<Mutex<Vec<Transaction>>>,
 }
 
 impl Node {
@@ -139,10 +161,11 @@ impl Node {
             address,
             peers: Arc::new(Mutex::new(HashMap::new())),
             blockchain: Arc::new(Mutex::new(Blockchain::load_from_file())),
+            pending_transactions: Arc::new(Mutex::new(vec![])),
         })
     }
 
-    fn add_peer(&self, peer_address: SocketAddr) {
+    fn add_peer(self: &Arc<Self>, peer_address: SocketAddr) {
         let peer = Peer { address: peer_address };
         self.peers.lock().unwrap().insert(peer_address, peer);
         info!("Added peer: {}", peer_address);
@@ -199,26 +222,59 @@ impl Node {
             if let Err(e) = stream.write(response.as_bytes()) {
                 error!("Failed to write to stream: {}", e);
             }
-        } else if message.starts_with("POST /block") {
+        } else if message.starts_with("POST /transaction") {
+            let parts: Vec<&str> = message.splitn(2, "\r\n\r\n").collect();
+            if parts.len() == 2 && !parts[1].is_empty() {
+                info!("Request body: {}", parts[1]);
+                match serde_json::from_str::<Transaction>(parts[1]) {
+                    Ok(transaction) => {
+                        let mut pending_transactions = self.pending_transactions.lock().unwrap();
+                        pending_transactions.push(transaction);
+                        let response = "HTTP/1.1 201 CREATED\r\n\r\n";
+                        if let Err(e) = stream.write(response.as_bytes()) {
+                            error!("Failed to write to stream: {}", e);
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to parse JSON: {}", e);
+                        let response = format!("HTTP/1.1 400 BAD REQUEST\r\n\r\nInvalid JSON body: {}", e);
+                        if let Err(e) = stream.write(response.as_bytes()) {
+                            error!("Failed to write to stream: {}", e);
+                        }
+                    }
+                }
+            } else {
+                error!("Empty body");
+                let response = "HTTP/1.1 400 BAD REQUEST\r\n\r\nEmpty body";
+                if let Err(e) = stream.write(response.as_bytes()) {
+                    error!("Failed to write to stream: {}", e);
+                }
+            }
+        } else if message.starts_with("POST /mine") {
             let parts: Vec<&str> = message.splitn(2, "\r\n\r\n").collect();
             if parts.len() == 2 && !parts[1].is_empty() {
                 info!("Request body: {}", parts[1]);
                 match serde_json::from_str::<serde_json::Value>(parts[1]) {
                     Ok(json_value) => {
-                        if let Some(data) = json_value.get("data") {
+                        if let Some(miner) = json_value.get("miner") {
+                            let miner_address = miner.as_str().unwrap().to_string();
                             let mut blockchain = self.blockchain.lock().unwrap();
-                            blockchain.reload_from_file(); // Reload the blockchain from the file before adding a new block
-                            let previous_hash = blockchain.latest_block().hash.clone();
-                            let new_block = Block::new(blockchain.latest_block().index + 1, data.as_str().unwrap().to_string(), previous_hash);
-                            blockchain.add_block(new_block.clone());
-                            self.broadcast(format!("NEW BLOCK\r\n\r\n{}", serde_json::to_string(&new_block).unwrap()));
+                            let mut transactions = self.pending_transactions.lock().unwrap().clone();
+                            transactions.push(Transaction {
+                                from: "network".to_string(),
+                                to: miner_address.clone(),
+                                amount: 50, // Block reward
+                            });
+                            let mut new_block = Block::new(blockchain.blocks.len() as u32, transactions, blockchain.latest_block().hash.clone());
+                            new_block.mine_block(DIFFICULTY_PREFIX);
+                            blockchain.add_block(new_block);
                             let response = "HTTP/1.1 201 CREATED\r\n\r\n";
                             if let Err(e) = stream.write(response.as_bytes()) {
                                 error!("Failed to write to stream: {}", e);
                             }
                         } else {
-                            error!("Invalid JSON body: missing field `data`");
-                            let response = "HTTP/1.1 400 BAD REQUEST\r\n\r\nInvalid JSON body: missing field `data`";
+                            error!("Invalid JSON body: missing field `miner`");
+                            let response = "HTTP/1.1 400 BAD REQUEST\r\n\r\nInvalid JSON body: missing field `miner`";
                             if let Err(e) = stream.write(response.as_bytes()) {
                                 error!("Failed to write to stream: {}", e);
                             }
