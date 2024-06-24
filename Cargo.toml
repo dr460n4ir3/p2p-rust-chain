@@ -1,0 +1,13 @@
+[package]
+name = "p2p-rust-chain"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+env_logger = "0.11.3"
+log = "0.4.21"
+serde = "1.0.203"
+serde_derive = "1.0.203"
+serde_json = "1.0.117"
+sha2 = "0.10.8"
+
